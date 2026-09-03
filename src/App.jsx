@@ -194,20 +194,29 @@ function Health({ status, width }) {
   );
 }
 
-function ConsolePane({ rows }) {
+function ConsolePane({ rows, cell }) {
   const entries = useConsole();
-  const visible = entries.slice(Math.max(0, entries.length - Math.max(0, rows - 3)));
+  const slots = Math.max(0, rows - 3);
+  const startIdx = Math.max(0, entries.length - slots);
+  const visible = entries.slice(startIdx);
+  const lines = [];
+  for (let i = 0; i < slots; i++) {
+    const e = visible[i];
+    lines.push(e ? `${KIND_MARK[e.kind]}${e.text}`.padEnd(cell).slice(0, cell) : ' '.padEnd(cell));
+  }
   return (
     <Pane title={`console | ${entries.length} lines`} color={C.accent} rows={rows}>
-      {visible.length === 0 ? (
-        <Text dim>nothing yet - run an action or open the live log tab</Text>
+      {lines.length === 0 ? (
+        <Text dim>{'nothing yet - run an action or open the live log tab'.padEnd(cell).slice(0, cell)}</Text>
       ) : (
-        visible.map((e, i) => (
-          <Text key={entries.length - visible.length + i} color={KIND_COLORS[e.kind]} wrap="truncate">
-            {KIND_MARK[e.kind]}
-            {e.text}
-          </Text>
-        ))
+        lines.map((l, i) => {
+          const e = visible[i];
+          return (
+            <Text key={startIdx + i} color={e ? KIND_COLORS[e.kind] : undefined}>
+              {l}
+            </Text>
+          );
+        })
       )}
     </Pane>
   );
@@ -549,6 +558,7 @@ export default function App({ onExit }) {
 
   const leftW = Math.max(46, Math.floor(width * 0.5));
   const consoleRows = Math.max(10, Math.floor(height * 0.36));
+  const consoleCell = Math.max(24, width - leftW - 12);
 
   if (!cfg) {
     return (
@@ -587,7 +597,7 @@ export default function App({ onExit }) {
               )}
             </Box>
             <Box flexGrow={1}>
-              <ConsolePane rows={consoleRows} />
+              <ConsolePane rows={consoleRows} cell={consoleCell} />
             </Box>
           </Box>
         )}
@@ -608,7 +618,7 @@ export default function App({ onExit }) {
               </Pane>
             </Box>
             <Box flexGrow={1}>
-              <ConsolePane rows={consoleRows} />
+              <ConsolePane rows={consoleRows} cell={consoleCell} />
             </Box>
           </Box>
         )}
