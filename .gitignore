@@ -1,0 +1,7 @@
+node_modules/
+dist/
+config.json
+*.log
+.DS_Store
+.odoo-deck-elevate.cmd
+.odoo-deck-elevate.ps1
