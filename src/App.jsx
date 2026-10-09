@@ -18,6 +18,8 @@ import {
   resetStuckModuleStates,
   copyToClipboard,
   startLogTail,
+  cloneDatabase,
+  validateCloneDatabaseName,
 } from './odoo.js';
 
 const INSTALLED_STATES = ['installed', 'to upgrade', 'to install'];
@@ -251,6 +253,32 @@ function ModulePicker({ picker, index, width }) {
   );
 }
 
+function CloneWizard({ wizard, source, width }) {
+  return (
+    <Pane title="Snapshot & clone database" color={C.warn} rows={wizard.stage === 'name' ? 10 : 15}>
+      <Text>{`source: ${source}`.slice(0, width)}</Text>
+      {wizard.stage === 'name' ? (
+        <>
+          <Text dim>Enter a new name for a clone on this configured Odoo version.</Text>
+          <Text dim>Cross-version upgrades require Odoo's supported upgrade process.</Text>
+          <Text color={C.accent} bold>{`destination: ${wizard.destination || '_'}`.slice(0, width)}</Text>
+          <Text dim>lowercase letters, numbers, underscore; start with a letter; max 63 chars</Text>
+        </>
+      ) : (
+        <>
+          <Text>{`destination: ${wizard.destination}`.slice(0, width)}</Text>
+          <Text>Includes a PostgreSQL snapshot and the Odoo filestore.</Text>
+          <Text>Source and its licensing data remain unchanged.</Text>
+          <Text color={C.warn} bold>This does not reset subscription or expiry status.</Text>
+          <Text>Existing destination database or filestore will not be overwritten.</Text>
+          <Text dim>Snapshot is retained under Odoo data_dir/odoo-deck-backups.</Text>
+          <Text dim>Afterward, check db_name/dbfilter in odoo.conf if needed.</Text>
+        </>
+      )}
+    </Pane>
+  );
+}
+
 function ErrorScreen({ error, top, height, width }) {
   const lines = error.text.split('\n');
   const rows = Math.max(10, height - 9);
@@ -278,11 +306,13 @@ function ErrorScreen({ error, top, height, width }) {
   );
 }
 
-function Footer({ busy, picker, screen, hasError, configOk }) {
+function Footer({ busy, picker, cloneWizard, screen, hasError, configOk }) {
   let hint;
   if (busy) hint = 'running - wait for it to finish';
   else if (picker)
     hint = 'up/down move | space toggle | a all | n none | enter run | esc cancel';
+  else if (cloneWizard)
+    hint = cloneWizard.stage === 'name' ? 'type destination | enter continue | esc cancel' : 'y/enter clone | n/esc cancel';
   else if (screen === 'error') hint = 'c copy traceback to clipboard | h/1 back';
   else if (screen === 'settings') hint = 'up/down field | enter edit | esc done | s save | 1 home';
   else if (screen === 'logs') hint = 'space pause/resume | c clear console | 1 home | 3 settings';
@@ -306,6 +336,7 @@ export default function App({ onExit }) {
   const [busy, setBusy] = useState(null);
   const [actionIndex, setActionIndex] = useState(0);
   const [picker, setPicker] = useState(null);
+  const [cloneWizard, setCloneWizard] = useState(null);
   const [pickerIndex, setPickerIndex] = useState(0);
   const [settingsIndex, setSettingsIndex] = useState(0);
   const [editingKey, setEditingKey] = useState(null);
@@ -423,6 +454,22 @@ export default function App({ onExit }) {
     setPickerIndex(0);
   }
 
+  function beginClone() {
+    setCloneWizard({ stage: 'name', destination: '' });
+  }
+
+  function confirmClone() {
+    const destination = cloneWizard.destination.trim();
+    try {
+      validateCloneDatabaseName(destination, cfgRef.current.db.name);
+    } catch (error) {
+      consoleEmit('warn', error.message);
+      return;
+    }
+    setCloneWizard(null);
+    run(`clone database to ${destination}`, () => cloneDatabase(cfgRef.current, destination));
+  }
+
   const hasError = !!lastError;
   const menu = [];
   const add = (id, label, fn, need = {}) => {
@@ -433,6 +480,7 @@ export default function App({ onExit }) {
   add('install', 'Install modules', () => openPicker('install'), { admin: true, db: true });
   add('upgrade', 'Upgrade modules', () => openPicker('upgrade'), { admin: true, db: true });
   add('copyUpgrade', 'Copy + upgrade modules', () => openPicker('copyUpgrade'), { admin: true, db: true });
+  add('clone', 'Snapshot & clone database (same version)', beginClone, { admin: true, db: true });
   add('reset', 'Reset stuck module states', () => run('reset module states', () => resetStuckModuleStates(cfgRef.current)), { db: true });
   add('restart', 'Restart Odoo service', () => run('restart service', () => restartService(cfgRef.current)), { admin: true });
   add('logs', 'Open live log tail', () => setScreen('logs'));
@@ -474,6 +522,26 @@ export default function App({ onExit }) {
       else if (input === 'n') setPicker((p) => ({ ...p, chosen: new Set() }));
       else if (key.return) confirmPicker();
       else if (key.escape) setPicker(null);
+      return;
+    }
+
+    if (cloneWizard) {
+      if (cloneWizard.stage === 'name') {
+        if (key.escape) setCloneWizard(null);
+        else if (key.return) {
+          if (!cloneWizard.destination) consoleEmit('warn', 'enter a destination database name.');
+          else setCloneWizard((w) => ({ ...w, stage: 'confirm' }));
+        } else if (key.backspace || key.delete || input === '\u0008' || input === '\u007f') {
+          setCloneWizard((w) => ({ ...w, destination: w.destination.slice(0, -1) }));
+        } else if (input) {
+          const next = `${cloneWizard.destination}${input.toLowerCase()}`;
+          if (/^[a-z][a-z0-9_]{0,62}$/.test(next)) setCloneWizard((w) => ({ ...w, destination: next }));
+        }
+      } else if (key.escape || input === 'n' || input === 'N') {
+        setCloneWizard(null);
+      } else if (key.return || input === 'y' || input === 'Y') {
+        confirmClone();
+      }
       return;
     }
 
@@ -584,6 +652,8 @@ export default function App({ onExit }) {
             <Box flexDirection="column" width={leftW} marginRight={1}>
               {picker ? (
                 <ModulePicker picker={picker} index={pickerIndex} width={leftW - 6} />
+              ) : cloneWizard ? (
+                <CloneWizard wizard={cloneWizard} source={cfg.db.name} width={leftW - 6} />
               ) : (
                 <>
                   <Pane title="Actions" color={C.accent} rows={menu.length + 5}>
@@ -676,7 +746,7 @@ export default function App({ onExit }) {
         {screen === 'error' && !hasError && <Text dim>no error recorded.</Text>}
       </Box>
 
-      <Footer busy={busy} picker={picker} screen={screen} hasError={hasError} configOk={String(menu.length)} />
+      <Footer busy={busy} picker={picker} cloneWizard={cloneWizard} screen={screen} hasError={hasError} configOk={String(menu.length)} />
     </Box>
   );
 }

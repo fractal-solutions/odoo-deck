@@ -1,5 +1,5 @@
-import { stat, readdir, readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { stat, readdir, readFile, mkdir, cp } from 'node:fs/promises';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { consoleEmit } from './console.js';
 import { setLastError } from './errors.js';
 
@@ -89,9 +89,13 @@ export async function runProc(exe, args, opts = {}) {
 }
 
 export async function runPsql(cfg, sql, extra = []) {
+  return runPsqlOn(cfg, cfg.db.name, sql, extra);
+}
+
+async function runPsqlOn(cfg, database, sql, extra = []) {
   const { stdout, exitCode } = await runProc(
     cfg.psql,
-    ['-h', cfg.db.host, '-p', String(cfg.db.port), '-U', cfg.db.user, '-d', cfg.db.name, '-t', '-A', '-F', '|', '-c', sql, ...extra],
+    ['-h', cfg.db.host, '-p', String(cfg.db.port), '-U', cfg.db.user, '-d', database, '-t', '-A', '-F', '|', '-c', sql, ...extra],
     { env: { PGPASSWORD: cfg.db.password }, quiet: true },
   );
   return { rows: stdout.split('\n').map((s) => s.trim()).filter(Boolean), exitCode };
@@ -155,12 +159,175 @@ export async function ensureService(cfg, wantRunning) {
 
 export async function dbReachable(cfg) {
   if (!(await fileExists(cfg.psql))) return false;
-  const { stdout } = await runProc(
-    cfg.psql,
-    ['-h', cfg.db.host, '-p', String(cfg.db.port), '-U', cfg.db.user, '-d', cfg.db.name, '-t', '-A', '-c', 'SELECT 1'],
-    { env: { PGPASSWORD: cfg.db.password }, quiet: true },
+  const { rows, exitCode } = await runPsqlOn(cfg, cfg.db.name, 'SELECT 1');
+  return exitCode === 0 && rows[0] === '1';
+}
+
+export function validateCloneDatabaseName(name, sourceName) {
+  if (!/^[a-z][a-z0-9_]{0,62}$/.test(name)) {
+    throw new Error('Database name must be 1-63 lowercase letters, numbers, or underscores, and start with a letter.');
+  }
+  if (name.toLowerCase() === String(sourceName).toLowerCase()) {
+    throw new Error('The destination database must have a different name from the source.');
+  }
+}
+
+async function configuredDataDir(cfg) {
+  const text = await readFile(cfg.odooConf, 'utf8');
+  let inOptions = false;
+  let value = '';
+  for (const line of text.split(/\r?\n/)) {
+    const section = line.match(/^\s*\[([^\]]+)\]/);
+    if (section) {
+      inOptions = section[1].toLowerCase() === 'options';
+      continue;
+    }
+    if (!inOptions) continue;
+    const setting = line.match(/^\s*data_dir\s*=\s*(.*?)\s*$/i);
+    if (setting) {
+      value = setting[1].replace(/^(['"])(.*)\1$/, '$2').trim();
+      break;
+    }
+  }
+  if (!value) {
+    throw new Error(`data_dir is not set in ${cfg.odooConf}; configure it before cloning so attachments are included.`);
+  }
+  value = value.replace(/%([^%]+)%/g, (match, key) => process.env[key] ?? match);
+  if (process.platform === 'win32') {
+    value = value.replace(/([^\\/]+)(?=[\\/]|$)/g, (part) =>
+      part === '.' || part === '..' ? part : part.replace(/[. ]+$/g, ''),
+    );
+  }
+  return isAbsolute(value) ? resolve(value) : resolve(dirname(cfg.odooConf), value);
+}
+
+async function pathExists(path) {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function safePathPart(value) {
+  return String(value).replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+export async function cloneDatabase(cfg, destination) {
+  validateCloneDatabaseName(destination, cfg.db.name);
+  if (/[\\/]/.test(cfg.db.name)) throw new Error('The configured source database name is not safe to use as a filestore path.');
+  if (!(await isAdmin())) throw new Error('Run odoo-deck as Administrator to stop and restart the Odoo service.');
+  if (!(await dbReachable(cfg))) throw new Error(`Source database ${cfg.db.name} is not reachable.`);
+  if (!(await fileExists(cfg.odooConf))) throw new Error(`odoo.conf not found: ${cfg.odooConf}`);
+
+  const toolDir = dirname(cfg.psql);
+  const pgDump = join(toolDir, 'pg_dump.exe');
+  const pgRestore = join(toolDir, 'pg_restore.exe');
+  const createdb = join(toolDir, 'createdb.exe');
+  for (const path of [pgDump, pgRestore, createdb]) {
+    if (!(await fileExists(path))) throw new Error(`Required PostgreSQL tool not found: ${path}`);
+  }
+
+  const service = await serviceStatus(cfg);
+  if (service === 'unknown') throw new Error(`Service ${cfg.service} not found or not reachable.`);
+
+  const dataDir = await configuredDataDir(cfg);
+  if (!(await dirExists(dataDir))) throw new Error(`Odoo data_dir does not exist: ${dataDir}`);
+  const filestoreRoot = join(dataDir, 'filestore');
+  const sourceFilestore = join(filestoreRoot, cfg.db.name);
+  const destinationFilestore = join(filestoreRoot, destination);
+  if (await pathExists(destinationFilestore)) {
+    throw new Error(`Destination filestore already exists: ${destinationFilestore}. Nothing was overwritten.`);
+  }
+
+  const { rows: existingDbs, exitCode: checkExit } = await runPsqlOn(
+    cfg,
+    cfg.db.name,
+    `SELECT datname FROM pg_database WHERE datname = ${sqlQuote(destination)}`,
   );
-  return stdout.trim() === '1';
+  if (checkExit !== 0) throw new Error('Could not check whether the destination database already exists.');
+  if (existingDbs.length) throw new Error(`Destination database already exists: ${destination}. Nothing was overwritten.`);
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const snapshotDir = join(dataDir, 'odoo-deck-backups', `${safePathPart(cfg.db.name)}-${safePathPart(destination)}-${timestamp}`);
+  await mkdir(dirname(snapshotDir), { recursive: true });
+  await mkdir(snapshotDir);
+  const dumpPath = join(snapshotDir, `${safePathPart(cfg.db.name)}.dump`);
+  const snapshotFilestore = join(snapshotDir, 'filestore');
+
+  const wasRunning = service === 'running';
+  let destinationCreated = false;
+  let operationError;
+  try {
+    if (wasRunning) await ensureService(cfg, false);
+
+    consoleEmit('sys', `creating PostgreSQL snapshot of ${cfg.db.name}...`);
+    const dump = await runProc(
+      pgDump,
+      ['-h', cfg.db.host, '-p', String(cfg.db.port), '-U', cfg.db.user, '--format=custom', '--file', dumpPath, cfg.db.name],
+      { env: { PGPASSWORD: cfg.db.password } },
+    );
+    if (dump.exitCode !== 0) throw new Error(`pg_dump failed (${dump.exitCode}): ${dump.stderr.trim()}`);
+
+    if (await dirExists(sourceFilestore)) {
+      consoleEmit('sys', 'copying Odoo filestore into the snapshot...');
+      await cp(sourceFilestore, snapshotFilestore, { recursive: true, errorOnExist: true, force: false });
+    } else {
+      await mkdir(snapshotFilestore, { recursive: true });
+      consoleEmit('warn', 'source filestore directory is absent; snapshot includes an empty filestore.');
+    }
+
+    consoleEmit('sys', `creating destination database ${destination}...`);
+    const create = await runProc(
+      createdb,
+      ['-h', cfg.db.host, '-p', String(cfg.db.port), '-U', cfg.db.user, '--template=template0', `--owner=${cfg.db.user}`, destination],
+      { env: { PGPASSWORD: cfg.db.password } },
+    );
+    if (create.exitCode !== 0) throw new Error(`createdb failed (${create.exitCode}): ${create.stderr.trim()}`);
+    destinationCreated = true;
+
+    consoleEmit('sys', `restoring snapshot into ${destination}...`);
+    const restore = await runProc(
+      pgRestore,
+      ['-h', cfg.db.host, '-p', String(cfg.db.port), '-U', cfg.db.user, '--exit-on-error', '--no-owner', '-d', destination, dumpPath],
+      { env: { PGPASSWORD: cfg.db.password } },
+    );
+    if (restore.exitCode !== 0) throw new Error(`pg_restore failed (${restore.exitCode}): ${restore.stderr.trim()}`);
+
+    await mkdir(filestoreRoot, { recursive: true });
+    await cp(snapshotFilestore, destinationFilestore, { recursive: true, errorOnExist: true, force: false });
+
+    const verify = await runPsqlOn(
+      cfg,
+      destination,
+      "SELECT to_regclass('public.ir_module_module') IS NOT NULL",
+    );
+    if (verify.exitCode !== 0 || verify.rows[0] !== 't') {
+      throw new Error('The restored database did not pass the Odoo schema check.');
+    }
+
+    consoleEmit('ok', `clone ready: ${destination} (same configured Odoo installation/version).`);
+    consoleEmit('sys', `snapshot retained at ${snapshotDir}`);
+    consoleEmit('sys', `odoo-deck still targets ${cfg.db.name}; select ${destination} in Settings when ready.`);
+    consoleEmit('warn', 'If odoo.conf restricts db_name or dbfilter, update that setting before opening the clone in Odoo.');
+    return { destination, snapshotDir };
+  } catch (error) {
+    operationError = error;
+    if (destinationCreated) {
+      throw new Error(`${error.message}\nDestination ${destination} may be incomplete; source and snapshot were retained at ${snapshotDir}.`);
+    }
+    throw new Error(`${error.message}\nSource was not changed. Snapshot location: ${snapshotDir}`);
+  } finally {
+    if (wasRunning) {
+      try {
+        await ensureService(cfg, true);
+      } catch (restartError) {
+        if (operationError) consoleEmit('err', `Odoo service could not be restarted: ${restartError.message}`);
+        else throw restartError;
+      }
+    }
+  }
 }
 
 export function sourceDirs(cfg) {

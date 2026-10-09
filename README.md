@@ -80,6 +80,8 @@ sources, database, service name, and paths are all in an editable `config.json`.
   resolve them (no more `module X depends on Y ... not available in your system`).
 - **Reset stuck module states** — clears the transient `to install / to upgrade / to remove`
   leftovers that make Odoo re-process stale batches on every boot.
+- **Snapshot & clone database** — creates a retained PostgreSQL + filestore snapshot and restores
+  it under a new name on the same configured Odoo installation.
 - **Elaborate error reporting**: when an Odoo install/upgrade fails, odoo-deck captures the whole
   block of log lines from the start of that run (including the Python traceback) and opens an
   error screen. Press `c` to copy the full report to the Windows clipboard.
@@ -150,6 +152,7 @@ prefixed with `>` and colored.
 | Install modules                 | Multi-select installable modules; auto-copies dependencies, stops the service, runs `odoo-bin -i`, restarts it. |
 | Upgrade modules                 | Multi-select modules already installed; runs `odoo-bin -u`.                                      |
 | Copy + upgrade modules          | Copy the chosen modules first, then upgrade them.                                                |
+| Snapshot & clone database       | Snapshots the configured database and filestore, then creates a new database name on this same Odoo installation. |
 | Reset stuck module states       | Clears `to install / to upgrade / to remove` states in the DB (same SQL Odoo itself uses after a failed run). |
 | Restart Odoo service            | Stops and starts the configured Windows service.                                                 |
 | Open live log tail              | Switches to the Logs tab.                                                                        |
@@ -245,6 +248,20 @@ printed to the console pane:
    `to remove`/`to upgrade` → `installed`, `to install` → `uninstalled`.
 5. **Error capture** — on a failed Odoo run, everything written to the log from the moment the CLI
    started (up to the last 500 lines) is stored, including the Python traceback.
+6. **Snapshot & clone** — stop the service if it was running, create a custom-format PostgreSQL
+  dump, copy `data_dir/filestore/<source>`, create the destination database from `template0`,
+  restore the dump, copy the filestore, and verify the Odoo module table. The service is returned
+  to its original running/stopped state. The source is never overwritten.
+
+  Snapshots are retained under
+  `<data_dir>/odoo-deck-backups/<source>-<destination>-<timestamp>/`. Existing destination
+  databases or filestore folders are refused. If restore fails after destination creation, the
+  destination may be incomplete; the source and snapshot are retained for inspection/retry.
+
+  This is a **same-install, same-version clone**, not a version upgrade. It copies licensing and
+  subscription data unchanged and does not renew or reset expiry. For another Odoo major version,
+  use Odoo's supported upgrade process; do not restore this dump directly into the other version.
+  If `odoo.conf` restricts `db_name` or `dbfilter`, adjust it before selecting the clone in Odoo.
 
 ---
 
@@ -397,7 +414,8 @@ skips the prompt.
 
 - **Windows only**: relies on `robocopy`, `clip.exe`, Windows services, and the local Odoo Windows
   layout.
-- Odoo operations run against a single configured database per session; change it in Settings.
+- Odoo actions use one configured database per session; a clone is created alongside it, and the
+  active odoo-deck database remains unchanged until you select another in Settings.
 - The install/upgrade cycle stops and restarts the service, so plan around other users of that
   instance.
 - Copying is one-way (repo → addons path). It never pulls changes back from the installed copy.

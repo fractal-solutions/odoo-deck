@@ -19,6 +19,7 @@ function check(token, label) {
 check('ODOO-DECK', 'header');
 check('Actions', 'home menu');
 check('Sync module sources', 'first action visible');
+check('Snapshot & clone database', 'same-version clone action visible');
 
 // tabs work from every screen via 1/2/3
 stdin.write('3');
